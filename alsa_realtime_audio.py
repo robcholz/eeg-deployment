@@ -45,7 +45,7 @@ class AlsaPcmDuplex:
 
     def __init__(
             self,
-            device: str = "hw:2,0",
+            device: str = "sysdefault",
             rate: int = 48_000,
             channels: int = 2,
             frames_per_block: int = 256,

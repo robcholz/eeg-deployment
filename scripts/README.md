@@ -3,13 +3,13 @@
 ## Audio
 
 ```shell
-python scripts/alsa_channel_test.py --device hw:2,0 --rate 48000 --frames-per-block 256
+python scripts/play_wav.py --device sysdefault --rate 48000 --channels 2 --frames-per-block 256 --wav <filename>
 ```
 
 ```shell
-python scripts/alsa_record_and_play.py --device hw:2,0 --rate 48000 --channels 2 --frames-per-block 256 --seconds 2 --wav /tmp/alsa_record_and_play.wav
+python scripts/alsa_record_and_play.py --device sysdefault --rate 48000 --channels 2 --frames-per-block 256 --seconds 2 --wav /tmp/alsa_record_and_play.wav
 ```
 
 ```shell
-python scripts/alsa_loopback.py --device hw:2,0 --rate 48000 --channels 2 --frames-per-block 256 --queue-frames 64 --seconds 3
+python scripts/alsa_loopback.py --device sysdefault --rate 48000 --channels 2 --frames-per-block 256 --queue-frames 64 --seconds 3
 ```

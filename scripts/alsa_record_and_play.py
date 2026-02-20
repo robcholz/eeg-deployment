@@ -14,7 +14,7 @@ from alsa_realtime_audio import AlsaPcmDuplex
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Record from mic, then play the WAV.")
-    parser.add_argument("--device", default="hw:2,0")
+    parser.add_argument("--device", default="sysdefault")
     parser.add_argument("--rate", type=int, default=48_000)
     parser.add_argument("--channels", type=int, default=2)
     parser.add_argument("--frames-per-block", type=int, default=256)
