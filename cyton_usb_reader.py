@@ -12,13 +12,12 @@ except ModuleNotFoundError:
     print("Missing dependency: pyserial. Install with: pip install pyserial", file=sys.stderr)
     sys.exit(2)
 
-
 START_BYTE = 0xA0
 PACKET_SIZE = 33
 STOP_HIGH_NIBBLE = 0xC0
 
 # ADS1299 conversion from counts to microvolts used by Cyton docs/SDK.
-EEG_SCALE_UV = (4.5 / 24.0 / (2**23 - 1)) * 1_000_000.0
+EEG_SCALE_UV = (4.5 / 24.0 / (2 ** 23 - 1)) * 1_000_000.0
 
 
 @dataclass
@@ -171,10 +170,10 @@ def set_channel_mode(ser: serial.Serial, channels: int) -> str:
 
 
 def _iter_cyton_records(
-    ser: serial.Serial,
-    channels: int,
-    duration_s: Optional[float],
-    max_samples: Optional[int],
+        ser: serial.Serial,
+        channels: int,
+        duration_s: Optional[float],
+        max_samples: Optional[int],
 ) -> "Iterator[Dict[str, object]]":
     buffer = bytearray()
     sample_count = 0
@@ -237,10 +236,10 @@ def _iter_cyton_records(
 
 
 def read_cyton_data(
-    ser: serial.Serial,
-    channels: int = 16,
-    duration_s: Optional[float] = 5.0,
-    max_samples: Optional[int] = None,
+        ser: serial.Serial,
+        channels: int = 16,
+        duration_s: Optional[float] = 5.0,
+        max_samples: Optional[int] = None,
 ) -> List[Dict[str, object]]:
     return list(
         _iter_cyton_records(
@@ -253,18 +252,18 @@ def read_cyton_data(
 
 
 def stream_packets(
-    ser: serial.Serial,
-    channels: int,
-    duration_s: Optional[float],
-    max_samples: Optional[int],
-    output_jsonl: bool,
+        ser: serial.Serial,
+        channels: int,
+        duration_s: Optional[float],
+        max_samples: Optional[int],
+        output_jsonl: bool,
 ) -> int:
     sample_count = 0
     for record in _iter_cyton_records(
-        ser=ser,
-        channels=channels,
-        duration_s=duration_s,
-        max_samples=max_samples,
+            ser=ser,
+            channels=channels,
+            duration_s=duration_s,
+            max_samples=max_samples,
     ):
         sample_count += 1
         if output_jsonl:
