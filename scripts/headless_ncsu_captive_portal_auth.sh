@@ -1,21 +1,9 @@
-#!/bin/sh
-set -eu
-
-# Usage:
-#   sudo ./ncsu_guest_portal_time.sh
-#
-# What it does:
-#   1) Hits neverssl.com to trigger Aruba captive portal redirect
-#   2) Submits NC State "I Agree" form (guest access)
-#   3) Sets system time from the captive portal HTTP Date header (works even if NTP is blocked)
-#   4) Tries to write RTC (best-effort)
-#   5) Verifies HTTPS connectivity
+#!/usr/bin/env bash
+set -euo pipefail
 
 COOKIE_JAR="/tmp/ncsu_guest_cookiejar"
-PORTAL_TRIGGER_URL="http://neverssl.com/"
-PORTAL_REDIRECT_URL="http://neverssl.com/?cmd=redirect&arubalp=12345"
-PORTAL_ACCEPT_PATH="/auth/index.html/u"
-PORTAL_ACCEPT_URL="http://neverssl.com${PORTAL_ACCEPT_PATH}"
+
+TRIGGER_URL="http://example.com/"
 
 log() { echo "[portal-time] $*"; }
 
@@ -28,11 +16,25 @@ need_root() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+detect_portal_base() {
+  local loc
+  loc="$(curl -sSIL --max-time 10 "$TRIGGER_URL" | awk -F': ' 'tolower($1)=="location"{print $2}' | tail -n 1 | tr -d '\r' || true)"
+
+  if [[ -z "$loc" ]]; then
+    echo ""
+    return 0
+  fi
+
+  if [[ "$loc" =~ ^(https?://[^/]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo ""
+  fi
+}
+
 sync_time_from_http_date() {
-  # We intentionally use HTTP (not HTTPS) so it works on web-only guest networks.
-  # The portal's nginx provides a Date header that is "good enough" to fix TLS validity issues.
   local date_hdr
-  date_hdr="$(curl -sI --max-time 10 "$PORTAL_TRIGGER_URL" | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r')"
+  date_hdr="$(curl -sSI --max-time 10 "$TRIGGER_URL" | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r')"
 
   if [[ -z "${date_hdr}" ]]; then
     log "Failed to read Date header for time sync."
@@ -40,7 +42,6 @@ sync_time_from_http_date() {
   fi
 
   log "HTTP Date header: ${date_hdr}"
-  # date -s accepts RFC 2822-ish date strings on GNU date
   date -s "${date_hdr}" >/dev/null
   log "System time set to: $(date)"
 }
@@ -48,38 +49,32 @@ sync_time_from_http_date() {
 accept_portal() {
   rm -f "$COOKIE_JAR"
 
-  log "Triggering captive portal (fetching $PORTAL_TRIGGER_URL)..."
-  curl -sS -L -c "$COOKIE_JAR" -b "$COOKIE_JAR" --max-time 10 "$PORTAL_TRIGGER_URL" >/dev/null || true
+  log "Triggering captive portal (fetching $TRIGGER_URL)..."
+  curl -sS -L -c "$COOKIE_JAR" -b "$COOKIE_JAR" --max-time 10 "$TRIGGER_URL" >/dev/null || true
 
-  # Attempt accept with the known form fields.
-  log "Submitting 'I Agree' to portal ($PORTAL_ACCEPT_URL)..."
-  local resp
+  local portal_base accept_url resp
+  portal_base="$(detect_portal_base)"
+
+  if [[ -z "$portal_base" ]]; then
+    log "No portal redirect detected (or cannot parse). Skipping portal accept."
+    return 0
+  fi
+
+  accept_url="${portal_base}/auth/index.html/u"
+  log "Detected portal base: $portal_base"
+  log "Submitting 'I Agree' to portal ($accept_url)..."
+
   resp="$(curl -sS -L -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
     -d "email=Guest@ncsu.edu" \
     -d "cmd=cmd" \
     -d "Login=I%20Agree" \
     --max-time 10 \
-    "$PORTAL_ACCEPT_URL" || true)"
+    "$accept_url" || true)"
 
-  if echo "$resp" | grep -qi "logout"; then
-    log "Portal acceptance likely succeeded (logout form detected)."
-    return 0
-  fi
-
-  # Some setups still show the guest page; that's OK—time sync + retry may be needed.
-  log "Portal acceptance response did not clearly indicate success; continuing."
-  return 0
-}
-
-verify_https() {
-  log "Verifying HTTPS (example.com)..."
-  if curl -sSI --max-time 10 https://example.com >/dev/null; then
-    log "HTTPS OK."
-    return 0
+  if echo "$resp" | grep -qiE "logout|success|accepted"; then
+    log "Portal acceptance likely succeeded."
   else
-    log "HTTPS still failing. You may still be captive or time is still wrong."
-    log "Try re-running the script, or switch from ncsu-guest to ncsu SSID for full access."
-    return 1
+    log "Portal acceptance response did not clearly indicate success; continuing."
   fi
 }
 
@@ -90,20 +85,24 @@ try_write_rtc() {
   fi
 }
 
+verify_https() {
+  log "Verifying HTTPS (example.com)..."
+  if curl -sSI --max-time 10 https://example.com >/dev/null; then
+    log "HTTPS OK."
+    return 0
+  fi
+  log "HTTPS still failing. You may still be captive or time is still wrong."
+  return 1
+}
+
 main() {
   need_root
-  have_cmd curl || { echo "curl is required. Install it first." >&2; exit 1; }
+  have_cmd curl || { echo "curl is required." >&2; exit 1; }
 
   accept_portal
-
-  # Time sync is the critical piece to fix "certificate not yet valid".
   sync_time_from_http_date || true
-
-  # If the portal was still active, accepting again after time fix sometimes helps.
   accept_portal
-
   try_write_rtc
-
   verify_https
   log "Done."
 }
