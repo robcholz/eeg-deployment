@@ -26,3 +26,9 @@ pactl set-default-sink alsa_output.usb-Andrea_Electronics_Andrea_Comm_USB-SA_Hea
 pactl set-sink-mute @DEFAULT_SINK@ 0
 pactl set-sink-volume @DEFAULT_SINK@ 80%
 ```
+
+### TUI
+
+```shell
+alsamixer -c 0
+```
