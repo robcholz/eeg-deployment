@@ -1,5 +1,11 @@
 # Scripts
 
+## Auth
+
+```shell
+sudo scripts/headless_ncsu_captive_portal_auth.sh
+```
+
 ## Audio
 
 ```shell
@@ -31,4 +37,11 @@ pactl set-sink-volume @DEFAULT_SINK@ 80%
 
 ```shell
 alsamixer -c 0
+```
+
+## Benchmark
+
+```shell
+cd earcode
+python main.py
 ```
