@@ -20,6 +20,7 @@ LOGGER = logging.getLogger("eeg_deployment.main")
 STREAM_CHUNK_SECONDS = 0.5
 STREAM_QUEUE_TIMEOUT_S = 1.0
 STREAM_PROGRESS_EVERY_CHUNKS = 4
+STREAM_PREBUFFER_SECONDS = 0.2
 
 
 class ColorFormatter(logging.Formatter):
@@ -66,6 +67,8 @@ class ProgramState:
     drained: bool | None = None
     consumer_consumed_all: bool | None = None
     output_underflows: int | None = None
+    prebuffer_blocks: int | None = None
+    inserted_silence_frames: int = 0
     timings_s: dict[str, float] = field(default_factory=dict)
 
 
@@ -109,6 +112,10 @@ def _log_event(event: str, state: ProgramState, **extra: object) -> None:
         fields.append(f"drained={state.drained}")
     if state.output_underflows is not None:
         fields.append(f"output_underflows={state.output_underflows}")
+    if state.prebuffer_blocks is not None:
+        fields.append(f"prebuffer_blocks={state.prebuffer_blocks}")
+    if state.inserted_silence_frames:
+        fields.append(f"inserted_silence_frames={state.inserted_silence_frames}")
     if state.gains:
         fields.append(f"gains={_short(state.gains)}")
     if state.timings_s:
@@ -285,27 +292,63 @@ def _audio_array_stats(audio: np.ndarray) -> dict[str, float]:
     }
 
 
-def _enqueue_mono_to_speaker(
-        audio: AlsaPcmDuplex, mono_audio: np.ndarray, timeout_s: float
-) -> tuple[int, int, int]:
-    import numpy as np
+class _SpeakerBlockPacker:
+    """
+    Convert variable-size mono chunks to fixed-size speaker blocks continuously.
+    Important: do not pad per chunk; pad once at final flush only.
+    """
 
-    pcm16 = (np.clip(mono_audio, -1.0, 1.0) * 32767.0).astype(np.int16)
-    raw = pcm16.tobytes()
-    block_bytes = audio.frames_per_block * audio.bytes_per_frame
-    pad = (-len(raw)) % block_bytes
-    if pad:
-        raw += b"\x00" * pad
+    def __init__(self, audio: AlsaPcmDuplex) -> None:
+        self.audio = audio
+        self.source_frames = 0
+        self.enqueued_blocks = 0
+        self.dropped_blocks = 0
+        self.inserted_silence_frames = 0
+        self._buffer = bytearray()
+        self._offset = 0
 
-    total_blocks = len(raw) // block_bytes
-    dropped_blocks = 0
-    for idx in range(total_blocks):
-        start = idx * block_bytes
-        block = raw[start: start + block_bytes]
-        ok = audio.write_speaker_frame(block, timeout_s=timeout_s)
-        if not ok:
-            dropped_blocks += 1
-    return int(pcm16.shape[0]), int(total_blocks), int(dropped_blocks)
+    def _available_bytes(self) -> int:
+        return len(self._buffer) - self._offset
+
+    def push(self, mono_audio: np.ndarray, timeout_s: float, on_block_enqueued=None) -> None:
+        import numpy as np
+
+        pcm16 = (np.clip(mono_audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+        self.source_frames += int(pcm16.shape[0])
+        if self._offset == len(self._buffer):
+            self._buffer.clear()
+            self._offset = 0
+        self._buffer.extend(pcm16.tobytes())
+        self._flush_full_blocks(timeout_s=timeout_s, on_block_enqueued=on_block_enqueued)
+
+    def flush(self, timeout_s: float, on_block_enqueued=None) -> None:
+        block_bytes = self.audio.frames_per_block * self.audio.bytes_per_frame
+        available = self._available_bytes()
+        if available > 0:
+            pad = (-available) % block_bytes
+            if pad > 0:
+                self._buffer.extend(b"\x00" * pad)
+                self.inserted_silence_frames += pad // self.audio.bytes_per_frame
+        self._flush_full_blocks(timeout_s=timeout_s, on_block_enqueued=on_block_enqueued)
+
+    def _flush_full_blocks(self, timeout_s: float, on_block_enqueued=None) -> None:
+        block_bytes = self.audio.frames_per_block * self.audio.bytes_per_frame
+        while self._available_bytes() >= block_bytes:
+            start = self._offset
+            end = start + block_bytes
+            block = bytes(self._buffer[start:end])
+            self._offset = end
+            ok = self.audio.write_speaker_frame(block, timeout_s=timeout_s)
+            if ok:
+                self.enqueued_blocks += 1
+                if on_block_enqueued is not None:
+                    on_block_enqueued()
+            else:
+                self.dropped_blocks += 1
+
+        if self._offset > 0 and (self._offset == len(self._buffer) or self._offset > 262144):
+            del self._buffer[:self._offset]
+            self._offset = 0
 
 
 def _wait_for_playback_drain(audio: AlsaPcmDuplex, timeout_s: float) -> bool:
@@ -350,17 +393,39 @@ def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
         channels=state.playback_channels,
         frames_per_block=256,
     )
+    packer = _SpeakerBlockPacker(audio=audio)
 
     separation_s = 0.0
     gain_mix_s = 0.0
     enqueue_s = 0.0
-    enqueued_frames = 0
-    enqueued_blocks = 0
-    dropped_blocks = 0
+    stream_started = False
+    prebuffer_blocks = max(
+        4,
+        min(
+            32,
+            int((STREAM_PREBUFFER_SECONDS * state.sample_rate) / audio.frames_per_block),
+        ),
+    )
+    state.prebuffer_blocks = prebuffer_blocks
 
     state.phase = "stream_playback"
-    audio.start_output_stream()
-    _log_event("output_stream_started", state)
+
+    def _maybe_start_output_stream() -> None:
+        nonlocal stream_started
+        if stream_started:
+            return
+        if packer.enqueued_blocks < prebuffer_blocks:
+            return
+        audio.start_output_stream()
+        stream_started = True
+        _log_event(
+            "output_stream_started",
+            state,
+            prebuffer_seconds=round(
+                (prebuffer_blocks * audio.frames_per_block) / state.sample_rate, 4
+            ),
+        )
+
     try:
         with wave.open(str(input_path), "rb") as wf:
             chunk_idx = 0
@@ -384,7 +449,7 @@ def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
 
                 if state.num_sources is None:
                     state.num_sources = len(separated_sources)
-                    state.gains = [1.0 for _ in separated_sources]
+                    state.gains = [1.0 for _ in separated_sources] # todo
                     _log_event("gains_initialized", state)
 
                 t_mix = time.perf_counter()
@@ -392,21 +457,19 @@ def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
                 gain_mix_s += time.perf_counter() - t_mix
 
                 t_enq = time.perf_counter()
-                frames, blocks, dropped = _enqueue_mono_to_speaker(
-                    audio=audio,
+                packer.push(
                     mono_audio=mixed_output,
                     timeout_s=STREAM_QUEUE_TIMEOUT_S,
+                    on_block_enqueued=_maybe_start_output_stream,
                 )
                 enqueue_s += time.perf_counter() - t_enq
 
-                enqueued_frames += frames
-                enqueued_blocks += blocks
-                dropped_blocks += dropped
-                state.enqueued_frames = enqueued_frames
-                state.enqueued_blocks = enqueued_blocks
-                state.dropped_blocks = dropped_blocks
+                state.enqueued_frames = int(packer.source_frames)
+                state.enqueued_blocks = int(packer.enqueued_blocks)
+                state.dropped_blocks = int(packer.dropped_blocks)
+                state.inserted_silence_frames = int(packer.inserted_silence_frames)
                 state.chunks_processed = chunk_idx
-                state.mixed_samples = int((state.mixed_samples or 0) + frames)
+                state.mixed_samples = int(packer.source_frames)
 
                 if (
                         chunk_idx == 1
@@ -417,45 +480,73 @@ def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
                         "stream_progress",
                         state,
                         chunk_audio=_audio_array_stats(mixed_output),
+                        stream_started=stream_started,
                         queue_size=audio._spk_queue.qsize(),
                         playback_stats=asdict(audio.get_stats()),
                     )
+
+        t_enq = time.perf_counter()
+        packer.flush(
+            timeout_s=STREAM_QUEUE_TIMEOUT_S,
+            on_block_enqueued=_maybe_start_output_stream,
+        )
+        enqueue_s += time.perf_counter() - t_enq
+        state.enqueued_frames = int(packer.source_frames)
+        state.enqueued_blocks = int(packer.enqueued_blocks)
+        state.dropped_blocks = int(packer.dropped_blocks)
+        state.inserted_silence_frames = int(packer.inserted_silence_frames)
+        state.mixed_samples = int(packer.source_frames)
+        _log_event("speaker_flush_done", state, stream_started=stream_started)
+
+        if not stream_started:
+            audio.start_output_stream()
+            stream_started = True
+            _log_event(
+                "output_stream_started",
+                state,
+                reason="late_start_short_audio",
+            )
 
         state.phase = "stream_drain"
         _log_event(
             "drain_start",
             state,
-            enqueued_frames=enqueued_frames,
-            enqueued_blocks=enqueued_blocks,
-            dropped_blocks=dropped_blocks,
+            enqueued_frames=state.enqueued_frames,
+            enqueued_blocks=state.enqueued_blocks,
+            dropped_blocks=state.dropped_blocks,
         )
-        drain_timeout_s = max(3.0, (enqueued_frames / state.sample_rate) + 3.0)
+        enqueued_playback_frames = state.enqueued_blocks * audio.frames_per_block
+        drain_timeout_s = max(3.0, (enqueued_playback_frames / state.sample_rate) + 3.0)
         drained = _wait_for_playback_drain(audio, timeout_s=drain_timeout_s)
         stats = audio.get_stats()
         state.played_frames = int(stats.frames_out)
         state.queue_drops = int(stats.queue_drops)
         state.drained = bool(drained)
         state.output_underflows = int(stats.output_underflows)
-        state.consumer_consumed_all = bool(drained and dropped_blocks == 0)
+        state.consumer_consumed_all = bool(
+            drained and state.dropped_blocks == 0 and state.queue_drops == 0
+        )
         _log_event("drain_done", state, drained=drained, playback_stats=asdict(stats))
         _log_event(
             "consumption_check",
             state,
-            enqueued_frames=enqueued_frames,
-            enqueued_blocks=enqueued_blocks,
-            dropped_blocks=dropped_blocks,
+            enqueued_frames=state.enqueued_frames,
+            enqueued_blocks=state.enqueued_blocks,
+            dropped_blocks=state.dropped_blocks,
             queue_drops=state.queue_drops,
+            inserted_silence_frames=state.inserted_silence_frames,
         )
         if not state.consumer_consumed_all:
             LOGGER.warning(
                 "consumer did not fully drain produced audio blocks "
                 "(drained=%s dropped_blocks=%s)",
                 drained,
-                dropped_blocks,
+                state.dropped_blocks,
             )
     finally:
-        audio.stop_output_stream()
-        _log_event("output_stream_stopped", state)
+        if stream_started:
+            audio.stop_output_stream()
+            _log_event("output_stream_stopped", state)
 
     state.timings_s["snn_separation"] = round(separation_s, 4)
     state.timings_s["apply_gains"] = round(gain_mix_s, 4)
@@ -480,6 +571,7 @@ def main() -> None:
         python=sys.version.split()[0],
         checkpoint=str(SNN_MODEL_PATH),
         stream_chunk_seconds=STREAM_CHUNK_SECONDS,
+        stream_prebuffer_seconds=STREAM_PREBUFFER_SECONDS,
     )
 
     try:
@@ -508,6 +600,8 @@ def main() -> None:
                        "enqueued_frames": state.enqueued_frames,
                        "enqueued_blocks": state.enqueued_blocks,
                        "dropped_blocks": state.dropped_blocks,
+                       "inserted_silence_frames": state.inserted_silence_frames,
+                       "prebuffer_blocks": state.prebuffer_blocks,
                        "drained": state.drained,
                        "output_underflows": state.output_underflows,
                        "consumer_consumed_all": state.consumer_consumed_all,
