@@ -73,28 +73,68 @@ sync_time_from_http_date() {
   log "System time set to: $(date)"
 }
 
+parse_meta_refresh_url() {
+  # Extract url=... from <meta http-equiv='refresh' content='...; url=...'>
+  sed -n "s/.*http-equiv=['\"]refresh['\"][^>]*content=['\"][^;]*;\s*url=\([^\"'> ]*\).*/\1/ip" \
+    | head -n 1
+}
+
 accept_portal() {
   rm -f "$COOKIE_JAR"
 
   log "Triggering captive portal (fetching $TRIGGER_URL)..."
 
-  # Fetch HTML (also populates cookies)
   local html portal_base action accept_url resp
-  html="$(fetch_portal_html)"
 
-  portal_base="$(detect_portal_base)"
-  if [[ -z "$portal_base" ]]; then
-    log "No portal detected. Skipping portal accept."
+  # 1) Fetch initial page (may be captive.apple.com meta refresh)
+  html="$(curl -sS -L -c "$COOKIE_JAR" -b "$COOKIE_JAR" --max-time 15 "$TRIGGER_URL" || true)"
+
+  # Try to parse form action directly (sometimes portal HTML is already here)
+  action="$(printf '%s' "$html" | parse_form_action || true)"
+
+  # 2) If no form action, look for meta refresh and follow it
+  if [[ -z "$action" ]]; then
+    local next
+    next="$(printf '%s' "$html" | parse_meta_refresh_url || true)"
+
+    if [[ -n "$next" ]]; then
+      # Make next absolute if needed
+      if [[ "$next" =~ ^// ]]; then
+        next="http:${next}"
+      elif [[ "$next" =~ ^/ ]]; then
+        next="http://captive.apple.com${next}"
+      fi
+
+      log "Found meta refresh -> $next"
+
+      # Fetch the redirected portal login page; capture effective URL to get base host
+      local eff
+      eff="$(curl -sS -L -o /dev/null -w '%{url_effective}\n' \
+              -c "$COOKIE_JAR" -b "$COOKIE_JAR" --max-time 15 "$next" || true)"
+      portal_base="$(url_base "$eff")"
+
+      html="$(curl -sS -L -c "$COOKIE_JAR" -b "$COOKIE_JAR" --max-time 15 "$next" || true)"
+      action="$(printf '%s' "$html" | parse_form_action || true)"
+    fi
+  fi
+
+  # 3) If we still don't have portal_base, try to derive it from TRIGGER effective URL (may be useful when portal uses 302)
+  if [[ -z "${portal_base:-}" ]]; then
+    portal_base="$(detect_portal_base || true)"
+  fi
+
+  # If still no portal base or still captive.apple.com, we can't submit
+  if [[ -z "${portal_base:-}" || "$portal_base" == "http://captive.apple.com" || "$portal_base" == "https://captive.apple.com" ]]; then
+    log "No portal detected (or still captive.apple.com). Skipping portal accept."
     return 0
   fi
 
-  action="$(printf '%s' "$html" | parse_form_action)"
   if [[ -z "$action" ]]; then
     log "Portal detected ($portal_base) but cannot find form action. Skipping."
     return 1
   fi
 
-  # Build accept URL from action (absolute, scheme-relative, or relative)
+  # 4) Build accept URL
   if [[ "$action" =~ ^https?:// ]]; then
     accept_url="$action"
   elif [[ "$action" =~ ^// ]]; then
@@ -139,7 +179,8 @@ verify_online_http() {
     return 0
   fi
 
-  log "Connectivity NOT OK (code=$code). Still captive/intercepted."
+  log "Connectivity NOT OK (code=$code). Dumping first lines of body:"
+  curl -sS -L --max-time 10 "$VERIFY_URL" | head -n 20 || true
   return 1
 }
 
