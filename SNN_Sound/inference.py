@@ -8,6 +8,7 @@ from spikingjelly.clock_driven import functional
 
 def separate_audio(wav_path, model_path, output_dir):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"using device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
     
     os.makedirs(output_dir, exist_ok=True)
     
