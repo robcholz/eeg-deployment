@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
-import tempfile
 import time
+import wave
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -15,6 +16,10 @@ from alsa_realtime_audio import AlsaPcmDuplex
 SNN_SOUND_DIR = Path(__file__).resolve().parent / "SNN_Sound"
 SNN_MODEL_PATH = SNN_SOUND_DIR / "save_models" / "best_snn.pt"
 LOGGER = logging.getLogger("eeg_deployment.main")
+
+STREAM_CHUNK_SECONDS = 0.5
+STREAM_QUEUE_TIMEOUT_S = 1.0
+STREAM_PROGRESS_EVERY_CHUNKS = 4
 
 
 class ColorFormatter(logging.Formatter):
@@ -47,13 +52,20 @@ class ProgramState:
     sample_rate: int | None = None
     input_samples: int | None = None
     num_sources: int | None = None
-    source_lengths: list[int] = field(default_factory=list)
     gains: list[float] = field(default_factory=list)
     mixed_samples: int | None = None
-    temp_wav: str = ""
     playback_device: str = "sysdefault"
     playback_channels: int = 1
     played_frames: int | None = None
+    chunks_total: int | None = None
+    chunks_processed: int = 0
+    queue_drops: int = 0
+    enqueued_frames: int = 0
+    enqueued_blocks: int = 0
+    dropped_blocks: int = 0
+    drained: bool | None = None
+    consumer_consumed_all: bool | None = None
+    output_underflows: int | None = None
     timings_s: dict[str, float] = field(default_factory=dict)
 
 
@@ -89,16 +101,22 @@ def _log_event(event: str, state: ProgramState, **extra: object) -> None:
         f"mixed_samples={state.mixed_samples}",
         f"played_frames={state.played_frames}",
         f"device={state.playback_device}",
+        f"chunks={state.chunks_processed}/{state.chunks_total}",
     ]
+    if state.consumer_consumed_all is not None:
+        fields.append(f"consumer_consumed_all={state.consumer_consumed_all}")
+    if state.drained is not None:
+        fields.append(f"drained={state.drained}")
+    if state.output_underflows is not None:
+        fields.append(f"output_underflows={state.output_underflows}")
     if state.gains:
         fields.append(f"gains={_short(state.gains)}")
     if state.timings_s:
         fields.append(f"timings_s={_short(state.timings_s)}")
-    if state.temp_wav:
-        fields.append(f"temp_wav={state.temp_wav}")
     for key, value in extra.items():
         fields.append(f"{key}={_short(value)}")
     LOGGER.info(" | ".join(fields))
+
 
 def _to_float32(audio: np.ndarray) -> np.ndarray:
     import numpy as np
@@ -116,17 +134,38 @@ def _to_float32(audio: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported WAV dtype: {audio.dtype}")
 
 
-def _load_mono_wav(path: Path) -> tuple[int, np.ndarray]:
-    import numpy as np
-    from scipy.io import wavfile
+def _read_wav_header(path: Path) -> dict[str, int]:
+    with wave.open(str(path), "rb") as wf:
+        if wf.getcomptype() != "NONE":
+            raise ValueError(f"Compressed WAV is not supported: comptype={wf.getcomptype()}")
+        return {
+            "sample_rate": wf.getframerate(),
+            "channels": wf.getnchannels(),
+            "sample_width": wf.getsampwidth(),
+            "frames": wf.getnframes(),
+        }
 
-    sample_rate, audio = wavfile.read(str(path))
-    audio_f32 = _to_float32(audio)
-    if audio_f32.ndim == 2:
-        audio_f32 = audio_f32.mean(axis=1)
-    if audio_f32.ndim != 1:
-        raise ValueError(f"Unsupported WAV shape: {audio_f32.shape}")
-    return sample_rate, audio_f32.astype(np.float32)
+
+def _pcm_bytes_to_mono_float(raw_bytes: bytes, sample_width: int, channels: int) -> np.ndarray:
+    import numpy as np
+
+    if sample_width == 1:
+        audio = np.frombuffer(raw_bytes, dtype=np.uint8)
+    elif sample_width == 2:
+        audio = np.frombuffer(raw_bytes, dtype=np.int16)
+    elif sample_width == 4:
+        audio = np.frombuffer(raw_bytes, dtype=np.int32)
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sample_width}")
+
+    if channels > 1:
+        valid = audio.size - (audio.size % channels)
+        audio = audio[:valid]
+        if audio.size == 0:
+            return np.zeros(0, dtype=np.float32)
+        audio = audio.reshape(-1, channels).mean(axis=1)
+
+    return _to_float32(audio).astype(np.float32)
 
 
 def _import_snn_modules() -> tuple[type, object]:
@@ -138,77 +177,84 @@ def _import_snn_modules() -> tuple[type, object]:
     return SimpleSNN, functional
 
 
-def _separate_sources_with_snn(audio_mono: np.ndarray) -> list[np.ndarray]:
-    import numpy as np
-    import torch
+class SnnSeparator:
+    def __init__(self) -> None:
+        import torch
 
-    if not SNN_MODEL_PATH.exists():
-        raise FileNotFoundError(f"SNN model checkpoint not found: {SNN_MODEL_PATH}")
+        if not SNN_MODEL_PATH.exists():
+            raise FileNotFoundError(f"SNN model checkpoint not found: {SNN_MODEL_PATH}")
 
-    SimpleSNN, functional = _import_snn_modules()
+        self._torch = torch
+        self._n_fft = 512
+        self._hop_length = 160
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SimpleSNN(input_size=257, hidden_size=512, T=6).to(device)
+        simple_snn, functional = _import_snn_modules()
+        self._functional = functional
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = simple_snn(input_size=257, hidden_size=512, T=6).to(self.device)
 
-    state_dict = torch.load(str(SNN_MODEL_PATH), map_location=device)
-    model.load_state_dict(state_dict)
-    model.eval()
+        state_dict = torch.load(str(SNN_MODEL_PATH), map_location=self.device)
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
+        self.window = torch.hann_window(self._n_fft).to(self.device)
 
-    mix_tensor = torch.from_numpy(audio_mono).float().unsqueeze(0).to(device)
-    n_fft = 512
-    hop_length = 160
-    window = torch.hann_window(n_fft).to(device)
+    def separate_chunk(self, audio_mono: np.ndarray) -> list[np.ndarray]:
+        import numpy as np
 
-    with torch.no_grad():
-        mix_stft = torch.stft(
-            mix_tensor,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            return_complex=True,
-            window=window,
-        )
-        mix_mag = torch.abs(mix_stft)
-        mix_phase = torch.angle(mix_stft)
-        mix_input = torch.log1p(mix_mag)
+        torch = self._torch
+        target_len = int(audio_mono.shape[0])
+        if target_len == 0:
+            empty = np.zeros(0, dtype=np.float32)
+            return [empty, empty]
 
-        functional.reset_net(model)
-        m1_pred, m2_pred = model(mix_input)
+        chunk = audio_mono.astype(np.float32, copy=False)
+        if target_len < self._n_fft:
+            chunk = np.pad(chunk, (0, self._n_fft - target_len))
 
-        est_mag1 = mix_mag * m1_pred
-        est_mag2 = mix_mag * m2_pred
+        mix_tensor = torch.from_numpy(chunk).float().unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            mix_stft = torch.stft(
+                mix_tensor,
+                n_fft=self._n_fft,
+                hop_length=self._hop_length,
+                return_complex=True,
+                window=self.window,
+            )
+            mix_mag = torch.abs(mix_stft)
+            mix_phase = torch.angle(mix_stft)
+            mix_input = torch.log1p(mix_mag)
 
-        est_s1 = torch.istft(
-            est_mag1 * torch.exp(1j * mix_phase),
-            n_fft=n_fft,
-            hop_length=hop_length,
-            window=window,
-        )
-        est_s2 = torch.istft(
-            est_mag2 * torch.exp(1j * mix_phase),
-            n_fft=n_fft,
-            hop_length=hop_length,
-            window=window,
-        )
+            self._functional.reset_net(self.model)
+            m1_pred, m2_pred = self.model(mix_input)
 
-    source_1 = est_s1.squeeze().cpu().numpy().astype(np.float32)
-    source_2 = est_s2.squeeze().cpu().numpy().astype(np.float32)
-    target_len = audio_mono.shape[0]
-    source_1 = source_1[:target_len]
-    source_2 = source_2[:target_len]
-    if source_1.shape[0] < target_len:
-        source_1 = np.pad(source_1, (0, target_len - source_1.shape[0]))
-    if source_2.shape[0] < target_len:
-        source_2 = np.pad(source_2, (0, target_len - source_2.shape[0]))
+            est_mag1 = mix_mag * m1_pred
+            est_mag2 = mix_mag * m2_pred
 
-    return [source_1, source_2]
+            est_s1 = torch.istft(
+                est_mag1 * torch.exp(1j * mix_phase),
+                n_fft=self._n_fft,
+                hop_length=self._hop_length,
+                window=self.window,
+            )
+            est_s2 = torch.istft(
+                est_mag2 * torch.exp(1j * mix_phase),
+                n_fft=self._n_fft,
+                hop_length=self._hop_length,
+                window=self.window,
+            )
+
+        source_1 = est_s1.squeeze().cpu().numpy().astype(np.float32)
+        source_2 = est_s2.squeeze().cpu().numpy().astype(np.float32)
+        source_1 = source_1[:target_len]
+        source_2 = source_2[:target_len]
+        if source_1.shape[0] < target_len:
+            source_1 = np.pad(source_1, (0, target_len - source_1.shape[0]))
+        if source_2.shape[0] < target_len:
+            source_2 = np.pad(source_2, (0, target_len - source_2.shape[0]))
+        return [source_1, source_2]
 
 
 def apply_source_gains(sources: list[np.ndarray], gains: list[float]) -> np.ndarray:
-    """
-    Minimal gain-array API:
-    - sources[i] is multiplied by gains[i]
-    - outputs one mixed mono track
-    """
     import numpy as np
 
     if len(sources) == 0:
@@ -239,21 +285,187 @@ def _audio_array_stats(audio: np.ndarray) -> dict[str, float]:
     }
 
 
-def _write_temp_pcm16_wav(sample_rate: int, mono_audio: np.ndarray) -> str:
+def _enqueue_mono_to_speaker(
+        audio: AlsaPcmDuplex, mono_audio: np.ndarray, timeout_s: float
+) -> tuple[int, int, int]:
     import numpy as np
-    from scipy.io import wavfile
 
     pcm16 = (np.clip(mono_audio, -1.0, 1.0) * 32767.0).astype(np.int16)
-    fd, temp_path = tempfile.mkstemp(prefix="main_snn_mix_", suffix=".wav")
-    os.close(fd)
-    wavfile.write(temp_path, sample_rate, pcm16)
-    return temp_path
+    raw = pcm16.tobytes()
+    block_bytes = audio.frames_per_block * audio.bytes_per_frame
+    pad = (-len(raw)) % block_bytes
+    if pad:
+        raw += b"\x00" * pad
+
+    total_blocks = len(raw) // block_bytes
+    dropped_blocks = 0
+    for idx in range(total_blocks):
+        start = idx * block_bytes
+        block = raw[start: start + block_bytes]
+        ok = audio.write_speaker_frame(block, timeout_s=timeout_s)
+        if not ok:
+            dropped_blocks += 1
+    return int(pcm16.shape[0]), int(total_blocks), int(dropped_blocks)
+
+
+def _wait_for_playback_drain(audio: AlsaPcmDuplex, timeout_s: float) -> bool:
+    deadline = time.time() + timeout_s
+    sleep_s = audio.frames_per_block / audio.rate
+    # Reuse the same queue-drain condition used by AlsaPcmDuplex.play_wav().
+    while time.time() < deadline:
+        if audio._spk_queue.empty():
+            return True
+        time.sleep(sleep_s)
+    return audio._spk_queue.empty()
+
+
+def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
+    header = _read_wav_header(input_path)
+    state.sample_rate = int(header["sample_rate"])
+    state.input_samples = int(header["frames"])
+
+    chunk_samples = max(1, int(state.sample_rate * STREAM_CHUNK_SECONDS))
+    state.chunks_total = int(math.ceil(state.input_samples / chunk_samples))
+    _log_event(
+        "wav_header",
+        state,
+        channels=header["channels"],
+        sample_width=header["sample_width"],
+        chunk_samples=chunk_samples,
+    )
+
+    t0 = time.perf_counter()
+    separator = SnnSeparator()
+    state.timings_s["model_load"] = round(time.perf_counter() - t0, 4)
+    _log_event(
+        "snn_model_loaded",
+        state,
+        model_device=str(separator.device),
+        checkpoint=str(SNN_MODEL_PATH),
+    )
+
+    audio = AlsaPcmDuplex(
+        device=state.playback_device,
+        rate=state.sample_rate,
+        channels=state.playback_channels,
+        frames_per_block=256,
+    )
+
+    separation_s = 0.0
+    gain_mix_s = 0.0
+    enqueue_s = 0.0
+    enqueued_frames = 0
+    enqueued_blocks = 0
+    dropped_blocks = 0
+
+    state.phase = "stream_playback"
+    audio.start_output_stream()
+    _log_event("output_stream_started", state)
+    try:
+        with wave.open(str(input_path), "rb") as wf:
+            chunk_idx = 0
+            while True:
+                raw = wf.readframes(chunk_samples)
+                if not raw:
+                    break
+                chunk_idx += 1
+
+                chunk = _pcm_bytes_to_mono_float(
+                    raw_bytes=raw,
+                    sample_width=int(header["sample_width"]),
+                    channels=int(header["channels"]),
+                )
+                if chunk.size == 0:
+                    continue
+
+                t_sep = time.perf_counter()
+                separated_sources = separator.separate_chunk(chunk)
+                separation_s += time.perf_counter() - t_sep
+
+                if state.num_sources is None:
+                    state.num_sources = len(separated_sources)
+                    state.gains = [1.0 for _ in separated_sources]
+                    _log_event("gains_initialized", state)
+
+                t_mix = time.perf_counter()
+                mixed_output = apply_source_gains(separated_sources, state.gains)
+                gain_mix_s += time.perf_counter() - t_mix
+
+                t_enq = time.perf_counter()
+                frames, blocks, dropped = _enqueue_mono_to_speaker(
+                    audio=audio,
+                    mono_audio=mixed_output,
+                    timeout_s=STREAM_QUEUE_TIMEOUT_S,
+                )
+                enqueue_s += time.perf_counter() - t_enq
+
+                enqueued_frames += frames
+                enqueued_blocks += blocks
+                dropped_blocks += dropped
+                state.enqueued_frames = enqueued_frames
+                state.enqueued_blocks = enqueued_blocks
+                state.dropped_blocks = dropped_blocks
+                state.chunks_processed = chunk_idx
+                state.mixed_samples = int((state.mixed_samples or 0) + frames)
+
+                if (
+                        chunk_idx == 1
+                        or chunk_idx == state.chunks_total
+                        or chunk_idx % STREAM_PROGRESS_EVERY_CHUNKS == 0
+                ):
+                    _log_event(
+                        "stream_progress",
+                        state,
+                        chunk_audio=_audio_array_stats(mixed_output),
+                        queue_size=audio._spk_queue.qsize(),
+                        playback_stats=asdict(audio.get_stats()),
+                    )
+
+        state.phase = "stream_drain"
+        _log_event(
+            "drain_start",
+            state,
+            enqueued_frames=enqueued_frames,
+            enqueued_blocks=enqueued_blocks,
+            dropped_blocks=dropped_blocks,
+        )
+        drain_timeout_s = max(3.0, (enqueued_frames / state.sample_rate) + 3.0)
+        drained = _wait_for_playback_drain(audio, timeout_s=drain_timeout_s)
+        stats = audio.get_stats()
+        state.played_frames = int(stats.frames_out)
+        state.queue_drops = int(stats.queue_drops)
+        state.drained = bool(drained)
+        state.output_underflows = int(stats.output_underflows)
+        state.consumer_consumed_all = bool(drained and dropped_blocks == 0)
+        _log_event("drain_done", state, drained=drained, playback_stats=asdict(stats))
+        _log_event(
+            "consumption_check",
+            state,
+            enqueued_frames=enqueued_frames,
+            enqueued_blocks=enqueued_blocks,
+            dropped_blocks=dropped_blocks,
+            queue_drops=state.queue_drops,
+        )
+        if not state.consumer_consumed_all:
+            LOGGER.warning(
+                "consumer did not fully drain produced audio blocks "
+                "(drained=%s dropped_blocks=%s)",
+                drained,
+                dropped_blocks,
+            )
+    finally:
+        audio.stop_output_stream()
+        _log_event("output_stream_stopped", state)
+
+    state.timings_s["snn_separation"] = round(separation_s, 4)
+    state.timings_s["apply_gains"] = round(gain_mix_s, 4)
+    state.timings_s["enqueue_speaker"] = round(enqueue_s, 4)
 
 
 def main() -> None:
     _configure_logging()
     parser = argparse.ArgumentParser(
-        description="Separate input with SNN_Sound, apply gains, and play to speaker."
+        description="Stream input through SNN_Sound separation and play while processing."
     )
     parser.add_argument("--wav", required=True, help="Path to input WAV file.")
     args = parser.parse_args()
@@ -261,95 +473,53 @@ def main() -> None:
     total_t0 = time.perf_counter()
     input_path = Path(args.wav).expanduser()
     state = ProgramState(wav=str(input_path))
-    temp_wav_path = ""
     _log_event(
         "program_start",
         state,
         pid=os.getpid(),
         python=sys.version.split()[0],
         checkpoint=str(SNN_MODEL_PATH),
+        stream_chunk_seconds=STREAM_CHUNK_SECONDS,
     )
+
     try:
         state.phase = "validate_input"
         _log_event("input_validation_start", state)
         if not input_path.exists():
             raise FileNotFoundError(f"WAV file not found: {input_path}")
 
-        step_t0 = time.perf_counter()
-        state.phase = "load_wav"
-        sample_rate, audio_mono = _load_mono_wav(input_path)
-        state.sample_rate = sample_rate
-        state.input_samples = int(audio_mono.shape[0])
-        state.timings_s["load_wav"] = round(time.perf_counter() - step_t0, 4)
-        _log_event("wav_loaded", state, input_audio=_audio_array_stats(audio_mono))
-
-        step_t0 = time.perf_counter()
-        state.phase = "snn_separation"
-        separated_sources = _separate_sources_with_snn(audio_mono)
-        state.num_sources = len(separated_sources)
-        state.source_lengths = [int(source.shape[0]) for source in separated_sources]
-        state.timings_s["snn_separation"] = round(time.perf_counter() - step_t0, 4)
-        _log_event(
-            "sources_separated",
-            state,
-            source_stats=[_audio_array_stats(source) for source in separated_sources],
-        )
-
-        step_t0 = time.perf_counter()
-        state.phase = "apply_gains"
-        gains = [1.0 for _ in separated_sources]
-        mixed_output = apply_source_gains(separated_sources, gains)
-        state.gains = gains
-        state.mixed_samples = int(mixed_output.shape[0])
-        state.timings_s["apply_gains"] = round(time.perf_counter() - step_t0, 4)
-        _log_event("gains_applied", state, mixed_audio=_audio_array_stats(mixed_output))
-
-        step_t0 = time.perf_counter()
-        state.phase = "write_temp_wav"
-        temp_wav_path = _write_temp_pcm16_wav(sample_rate, mixed_output)
-        state.temp_wav = temp_wav_path
-        state.timings_s["write_temp_wav"] = round(time.perf_counter() - step_t0, 4)
-        _log_event("temp_wav_ready", state)
-
-        step_t0 = time.perf_counter()
-        state.phase = "playback"
-        _log_event("playback_start", state)
-        audio = AlsaPcmDuplex(
-            device=state.playback_device,
-            rate=state.sample_rate,
-            channels=state.playback_channels,
-            frames_per_block=256,
-        )
-        played = audio.play_wav(temp_wav_path)
-        state.played_frames = int(played)
-        state.timings_s["playback"] = round(time.perf_counter() - step_t0, 4)
-        _log_event("playback_done", state, playback_stats=asdict(audio.get_stats()))
+        _stream_process_and_play(input_path=input_path, state=state)
 
         state.phase = "completed"
         state.timings_s["total"] = round(time.perf_counter() - total_t0, 4)
         _log_event("program_done", state)
-        print(
-            {
-                "wav": state.wav,
-                "played_frames": state.played_frames,
-                "device": state.playback_device,
-                "channels": state.playback_channels,
-                "rate": state.sample_rate,
-                "num_sources": state.num_sources,
-                "gains": state.gains,
-                "timings_s": state.timings_s,
-            }
-        )
+        LOGGER.info("summary {}".format(
+                   {
+                       "wav": state.wav,
+                       "played_frames": state.played_frames,
+                       "device": state.playback_device,
+                       "channels": state.playback_channels,
+                       "rate": state.sample_rate,
+                       "num_sources": state.num_sources,
+                       "gains": state.gains,
+                       "chunks_processed": state.chunks_processed,
+                       "chunks_total": state.chunks_total,
+                       "queue_drops": state.queue_drops,
+                       "enqueued_frames": state.enqueued_frames,
+                       "enqueued_blocks": state.enqueued_blocks,
+                       "dropped_blocks": state.dropped_blocks,
+                       "drained": state.drained,
+                       "output_underflows": state.output_underflows,
+                       "consumer_consumed_all": state.consumer_consumed_all,
+                       "timings_s": state.timings_s,
+                   })
+                   )
     except Exception as exc:
         state.phase = "error"
         state.timings_s["total"] = round(time.perf_counter() - total_t0, 4)
         _log_event("program_error", state, error=str(exc))
         LOGGER.exception("program_error_traceback")
         raise
-    finally:
-        if temp_wav_path:
-            Path(temp_wav_path).unlink(missing_ok=True)
-            _log_event("temp_wav_deleted", state, deleted=True)
 
 
 if __name__ == "__main__":
