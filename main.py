@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import sys
+import threading
 import time
 import wave
 from dataclasses import asdict, dataclass, field
@@ -21,6 +22,16 @@ STREAM_CHUNK_SECONDS = 0.5
 STREAM_QUEUE_TIMEOUT_S = 1.0
 STREAM_PROGRESS_EVERY_CHUNKS = 4
 STREAM_PREBUFFER_SECONDS = 0.2
+EEG_GAIN_SMOOTHING_ALPHA = 0.35
+
+_EVENT_LEVELS = {
+    "program_start": logging.INFO,
+    "gains_initialized": logging.INFO,
+    "stream_progress": logging.INFO,
+    "drain_done": logging.INFO,
+    "program_done": logging.INFO,
+    "program_error": logging.ERROR,
+}
 
 
 class ColorFormatter(logging.Formatter):
@@ -44,6 +55,17 @@ class ColorFormatter(logging.Formatter):
             return super().format(record)
         finally:
             record.levelname = original_levelname
+
+
+class _SuppressSpikingjellyInfo(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if record.levelno < logging.WARNING and (
+            record.name.startswith("spikingjelly")
+            or message.startswith("spikingjelly.")
+        ):
+            return False
+        return True
 
 
 @dataclass
@@ -83,7 +105,13 @@ def _configure_logging() -> None:
         handler.setFormatter(ColorFormatter(fmt))
     else:
         handler.setFormatter(logging.Formatter(fmt))
+    handler.addFilter(_SuppressSpikingjellyInfo())
     root.addHandler(handler)
+    # Reduce noisy third-party INFO logs in normal runs.
+    logging.getLogger("spikingjelly").setLevel(logging.WARNING)
+    logging.getLogger("spikingjelly.clock_driven").setLevel(logging.WARNING)
+    logging.getLogger("spikingjelly.clock_driven.neuron").setLevel(logging.WARNING)
+    logging.getLogger("spikingjelly.clock_driven.lava_exchange").setLevel(logging.WARNING)
 
 
 def _short(value: object, limit: int = 220) -> str:
@@ -94,35 +122,55 @@ def _short(value: object, limit: int = 220) -> str:
 
 
 def _log_event(event: str, state: ProgramState, **extra: object) -> None:
-    fields = [
-        f"event={event}",
-        f"phase={state.phase}",
-        f"wav={state.wav}",
-        f"rate={state.sample_rate}",
-        f"input_samples={state.input_samples}",
-        f"num_sources={state.num_sources}",
-        f"mixed_samples={state.mixed_samples}",
-        f"played_frames={state.played_frames}",
-        f"device={state.playback_device}",
-        f"chunks={state.chunks_processed}/{state.chunks_total}",
-    ]
-    if state.consumer_consumed_all is not None:
-        fields.append(f"consumer_consumed_all={state.consumer_consumed_all}")
-    if state.drained is not None:
-        fields.append(f"drained={state.drained}")
-    if state.output_underflows is not None:
-        fields.append(f"output_underflows={state.output_underflows}")
-    if state.prebuffer_blocks is not None:
-        fields.append(f"prebuffer_blocks={state.prebuffer_blocks}")
-    if state.inserted_silence_frames:
-        fields.append(f"inserted_silence_frames={state.inserted_silence_frames}")
-    if state.gains:
-        fields.append(f"gains={_short(state.gains)}")
-    if state.timings_s:
-        fields.append(f"timings_s={_short(state.timings_s)}")
-    for key, value in extra.items():
-        fields.append(f"{key}={_short(value)}")
-    LOGGER.info(" | ".join(fields))
+    level = _EVENT_LEVELS.get(event, logging.DEBUG)
+    info_mode = level >= logging.INFO
+
+    fields = [f"event={event}", f"phase={state.phase}"]
+    if info_mode:
+        fields.append(f"chunks={state.chunks_processed}/{state.chunks_total}")
+        if state.gains:
+            fields.append(f"gains={_short(state.gains)}")
+        if state.output_underflows is not None:
+            fields.append(f"output_underflows={state.output_underflows}")
+        if state.queue_drops:
+            fields.append(f"queue_drops={state.queue_drops}")
+        queue_size = extra.get("queue_size")
+        if queue_size is not None:
+            fields.append(f"queue_size={_short(queue_size)}")
+        for key in ("error", "drained", "consumer_consumed_all", "stream_started"):
+            if key in extra:
+                fields.append(f"{key}={_short(extra[key])}")
+    else:
+        fields.extend(
+            [
+                f"wav={state.wav}",
+                f"rate={state.sample_rate}",
+                f"input_samples={state.input_samples}",
+                f"num_sources={state.num_sources}",
+                f"mixed_samples={state.mixed_samples}",
+                f"played_frames={state.played_frames}",
+                f"device={state.playback_device}",
+                f"chunks={state.chunks_processed}/{state.chunks_total}",
+            ]
+        )
+        if state.consumer_consumed_all is not None:
+            fields.append(f"consumer_consumed_all={state.consumer_consumed_all}")
+        if state.drained is not None:
+            fields.append(f"drained={state.drained}")
+        if state.output_underflows is not None:
+            fields.append(f"output_underflows={state.output_underflows}")
+        if state.prebuffer_blocks is not None:
+            fields.append(f"prebuffer_blocks={state.prebuffer_blocks}")
+        if state.inserted_silence_frames:
+            fields.append(f"inserted_silence_frames={state.inserted_silence_frames}")
+        if state.gains:
+            fields.append(f"gains={_short(state.gains)}")
+        if state.timings_s:
+            fields.append(f"timings_s={_short(state.timings_s)}")
+        for key, value in extra.items():
+            fields.append(f"{key}={_short(value)}")
+
+    LOGGER.log(level, " | ".join(fields))
 
 
 def _to_float32(audio: np.ndarray) -> np.ndarray:
@@ -182,6 +230,111 @@ def _import_snn_modules() -> tuple[type, object]:
     from spikingjelly.clock_driven import functional
 
     return SimpleSNN, functional
+
+
+class _EegSignalBuffer:
+    def __init__(self, real_time: bool) -> None:
+        self.real_time = real_time
+        self._latest: list[float] | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._eeg_module = None
+        self._enabled = False
+
+    def start(self) -> None:
+        try:
+            import eeg_main
+
+            self._eeg_module = eeg_main
+            # Use eeg_main mode switch without adding new public APIs.
+            if self.real_time:
+                setattr(self._eeg_module, "_MODE", "real-time")
+            else:
+                setattr(self._eeg_module, "_MODE", "offline")
+            self._thread = threading.Thread(
+                target=self._run,
+                name="eeg-signal-worker",
+                daemon=True,
+            )
+            self._thread.start()
+            self._enabled = True
+        except Exception as exc:
+            LOGGER.warning("eeg worker disabled: %s", exc)
+            self._enabled = False
+
+    def _run(self) -> None:
+        assert self._eeg_module is not None
+        getter = getattr(self._eeg_module, "eeg_get_signal")
+        while not self._stop.is_set():
+            try:
+                vec = getter()
+                cleaned = [float(v) for v in vec]
+                if not cleaned:
+                    continue
+                with self._lock:
+                    self._latest = cleaned
+            except Exception as exc:
+                LOGGER.warning("eeg_get_signal failed: %s", exc)
+                time.sleep(0.2)
+
+    def get_latest(self) -> list[float] | None:
+        with self._lock:
+            if self._latest is None:
+                return None
+            return list(self._latest)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._eeg_module is not None and hasattr(self._eeg_module, "_close_realtime_stream"):
+            try:
+                self._eeg_module._close_realtime_stream()  # noqa: SLF001
+            except Exception:
+                pass
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+
+def _normalize_weights(weights: list[float]) -> list[float]:
+    cleaned = [max(0.0, float(v)) for v in weights]
+    s = sum(cleaned)
+    if s <= 1e-8:
+        if not cleaned:
+            return []
+        return [1.0 / len(cleaned)] * len(cleaned)
+    return [v / s for v in cleaned]
+
+
+def _map_eeg_vector_to_gains(eeg_vec: list[float], num_sources: int) -> list[float]:
+    if num_sources <= 0:
+        return []
+    probs = _normalize_weights(eeg_vec)
+    if not probs:
+        return [1.0 / num_sources] * num_sources
+
+    if num_sources == 2:
+        if len(probs) >= 4:
+            # Map 4-class attention to 2 audio routes.
+            gains = [probs[0] + probs[1], probs[2] + probs[3]]
+        elif len(probs) >= 2:
+            gains = [probs[0], probs[1]]
+        else:
+            gains = [probs[0], 1.0 - probs[0]]
+        return _normalize_weights(gains)
+
+    padded = probs[:num_sources] + [0.0] * max(0, num_sources - len(probs))
+    return _normalize_weights(padded[:num_sources])
+
+
+def _smooth_gains(prev: list[float], target: list[float], alpha: float) -> list[float]:
+    if not prev or len(prev) != len(target):
+        return target
+    a = min(1.0, max(0.0, float(alpha)))
+    return [(1.0 - a) * p + a * t for p, t in zip(prev, target)]
 
 
 class SnnSeparator:
@@ -362,7 +515,7 @@ def _wait_for_playback_drain(audio: AlsaPcmDuplex, timeout_s: float) -> bool:
     return audio._spk_queue.empty()
 
 
-def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
+def _stream_process_and_play(input_path: Path, state: ProgramState, eeg_real_time: bool) -> None:
     header = _read_wav_header(input_path)
     state.sample_rate = int(header["sample_rate"])
     state.input_samples = int(header["frames"])
@@ -376,6 +529,9 @@ def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
         sample_width=header["sample_width"],
         chunk_samples=chunk_samples,
     )
+
+    eeg_buffer = _EegSignalBuffer(real_time=eeg_real_time)
+    eeg_buffer.start()
 
     t0 = time.perf_counter()
     separator = SnnSeparator()
@@ -409,6 +565,12 @@ def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
     state.prebuffer_blocks = prebuffer_blocks
 
     state.phase = "stream_playback"
+    _log_event(
+        "eeg_worker_started",
+        state,
+        eeg_mode="real-time" if eeg_real_time else "offline",
+        eeg_enabled=eeg_buffer.enabled,
+    )
 
     def _maybe_start_output_stream() -> None:
         nonlocal stream_started
@@ -449,8 +611,20 @@ def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
 
                 if state.num_sources is None:
                     state.num_sources = len(separated_sources)
-                    state.gains = [1.0, 0.0] #todo
+                    state.gains = [1.0 / state.num_sources] * state.num_sources
                     _log_event("gains_initialized", state)
+
+                eeg_vec = eeg_buffer.get_latest()
+                if eeg_vec is not None and state.num_sources is not None:
+                    target_gains = _map_eeg_vector_to_gains(
+                        eeg_vec=eeg_vec,
+                        num_sources=state.num_sources,
+                    )
+                    state.gains = _smooth_gains(
+                        prev=state.gains,
+                        target=target_gains,
+                        alpha=EEG_GAIN_SMOOTHING_ALPHA,
+                    )
 
                 t_mix = time.perf_counter()
                 mixed_output = apply_source_gains(separated_sources, state.gains)
@@ -480,6 +654,7 @@ def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
                         "stream_progress",
                         state,
                         chunk_audio=_audio_array_stats(mixed_output),
+                        eeg_signal=eeg_vec,
                         stream_started=stream_started,
                         queue_size=audio._spk_queue.qsize(),
                         playback_stats=asdict(audio.get_stats()),
@@ -544,6 +719,7 @@ def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
                 state.dropped_blocks,
             )
     finally:
+        eeg_buffer.stop()
         if stream_started:
             audio.stop_output_stream()
             _log_event("output_stream_stopped", state)
@@ -559,6 +735,11 @@ def main() -> None:
         description="Stream input through SNN_Sound separation and play while processing."
     )
     parser.add_argument("--wav", required=True, help="Path to input WAV file.")
+    parser.add_argument(
+        "--eeg-real-time",
+        action="store_true",
+        help="Use real-time Cyton signal in eeg_get_signal() instead of offline mode.",
+    )
     args = parser.parse_args()
 
     total_t0 = time.perf_counter()
@@ -580,12 +761,16 @@ def main() -> None:
         if not input_path.exists():
             raise FileNotFoundError(f"WAV file not found: {input_path}")
 
-        _stream_process_and_play(input_path=input_path, state=state)
+        _stream_process_and_play(
+            input_path=input_path,
+            state=state,
+            eeg_real_time=bool(args.eeg_real_time),
+        )
 
         state.phase = "completed"
         state.timings_s["total"] = round(time.perf_counter() - total_t0, 4)
         _log_event("program_done", state)
-        LOGGER.info("summary {}".format(
+        LOGGER.debug("summary {}".format(
                    {
                        "wav": state.wav,
                        "played_frames": state.played_frames,
