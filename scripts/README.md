@@ -45,3 +45,19 @@ alsamixer -c 0
 cd earcode
 python main.py
 ```
+
+## EEG Signal Read
+
+Read infinitely.
+
+```shell
+python cyton_usb_reader.py --duration 0 --channels 16
+```
+
+Read fixed number.
+
+```shell
+python cyton_usb_reader.py
+```
+
+

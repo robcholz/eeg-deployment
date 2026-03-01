@@ -449,7 +449,7 @@ def _stream_process_and_play(input_path: Path, state: ProgramState) -> None:
 
                 if state.num_sources is None:
                     state.num_sources = len(separated_sources)
-                    state.gains = [1.0 for _ in separated_sources] # todo
+                    state.gains = [1.0, 0.0] #todo
                     _log_event("gains_initialized", state)
 
                 t_mix = time.perf_counter()
