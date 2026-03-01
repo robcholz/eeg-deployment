@@ -23,6 +23,8 @@ STREAM_QUEUE_TIMEOUT_S = 1.0
 STREAM_PROGRESS_EVERY_CHUNKS = 4
 STREAM_PREBUFFER_SECONDS = 0.2
 EEG_GAIN_SMOOTHING_ALPHA = 0.35
+CHUNK_OVERRUN_WARN_RATIO = 0.9
+EEG_GET_WARN_MS = 800.0
 
 _EVENT_LEVELS = {
     "program_start": logging.INFO,
@@ -137,6 +139,17 @@ def _log_event(event: str, state: ProgramState, **extra: object) -> None:
         queue_size = extra.get("queue_size")
         if queue_size is not None:
             fields.append(f"queue_size={_short(queue_size)}")
+        for key in (
+            "chunk_audio_ms",
+            "sep_ms",
+            "mix_ms",
+            "enqueue_ms",
+            "total_ms",
+            "budget_ratio",
+            "eeg_get_ms",
+        ):
+            if key in extra:
+                fields.append(f"{key}={_short(extra[key])}")
         for key in ("error", "drained", "consumer_consumed_all", "stream_started"):
             if key in extra:
                 fields.append(f"{key}={_short(extra[key])}")
@@ -241,6 +254,7 @@ class _EegSignalBuffer:
         self._thread: threading.Thread | None = None
         self._eeg_module = None
         self._enabled = False
+        self._latest_get_ms: float | None = None
 
     def start(self) -> None:
         try:
@@ -268,12 +282,17 @@ class _EegSignalBuffer:
         getter = getattr(self._eeg_module, "eeg_get_signal")
         while not self._stop.is_set():
             try:
+                t0 = time.perf_counter()
                 vec = getter()
+                get_ms = (time.perf_counter() - t0) * 1000.0
                 cleaned = [float(v) for v in vec]
                 if not cleaned:
                     continue
                 with self._lock:
                     self._latest = cleaned
+                    self._latest_get_ms = float(get_ms)
+                if get_ms >= EEG_GET_WARN_MS:
+                    LOGGER.warning("eeg_get_signal slow: %.1f ms", get_ms)
             except Exception as exc:
                 LOGGER.warning("eeg_get_signal failed: %s", exc)
                 time.sleep(0.2)
@@ -283,6 +302,12 @@ class _EegSignalBuffer:
             if self._latest is None:
                 return None
             return list(self._latest)
+
+    def get_latest_get_ms(self) -> float | None:
+        with self._lock:
+            if self._latest_get_ms is None:
+                return None
+            return float(self._latest_get_ms)
 
     def stop(self) -> None:
         self._stop.set()
@@ -592,6 +617,7 @@ def _stream_process_and_play(input_path: Path, state: ProgramState, eeg_real_tim
         with wave.open(str(input_path), "rb") as wf:
             chunk_idx = 0
             while True:
+                t_chunk0 = time.perf_counter()
                 raw = wf.readframes(chunk_samples)
                 if not raw:
                     break
@@ -607,7 +633,8 @@ def _stream_process_and_play(input_path: Path, state: ProgramState, eeg_real_tim
 
                 t_sep = time.perf_counter()
                 separated_sources = separator.separate_chunk(chunk)
-                separation_s += time.perf_counter() - t_sep
+                sep_dt = time.perf_counter() - t_sep
+                separation_s += sep_dt
 
                 if state.num_sources is None:
                     state.num_sources = len(separated_sources)
@@ -628,7 +655,8 @@ def _stream_process_and_play(input_path: Path, state: ProgramState, eeg_real_tim
 
                 t_mix = time.perf_counter()
                 mixed_output = apply_source_gains(separated_sources, state.gains)
-                gain_mix_s += time.perf_counter() - t_mix
+                mix_dt = time.perf_counter() - t_mix
+                gain_mix_s += mix_dt
 
                 t_enq = time.perf_counter()
                 packer.push(
@@ -636,7 +664,8 @@ def _stream_process_and_play(input_path: Path, state: ProgramState, eeg_real_tim
                     timeout_s=STREAM_QUEUE_TIMEOUT_S,
                     on_block_enqueued=_maybe_start_output_stream,
                 )
-                enqueue_s += time.perf_counter() - t_enq
+                enq_dt = time.perf_counter() - t_enq
+                enqueue_s += enq_dt
 
                 state.enqueued_frames = int(packer.source_frames)
                 state.enqueued_blocks = int(packer.enqueued_blocks)
@@ -650,15 +679,38 @@ def _stream_process_and_play(input_path: Path, state: ProgramState, eeg_real_tim
                         or chunk_idx == state.chunks_total
                         or chunk_idx % STREAM_PROGRESS_EVERY_CHUNKS == 0
                 ):
+                    total_dt = time.perf_counter() - t_chunk0
+                    chunk_audio_ms = 1000.0 * (float(chunk.size) / float(state.sample_rate))
+                    budget_ratio = (1000.0 * total_dt / chunk_audio_ms) if chunk_audio_ms > 0 else None
                     _log_event(
                         "stream_progress",
                         state,
                         chunk_audio=_audio_array_stats(mixed_output),
+                        chunk_audio_ms=round(chunk_audio_ms, 1),
+                        sep_ms=round(1000.0 * sep_dt, 1),
+                        mix_ms=round(1000.0 * mix_dt, 1),
+                        enqueue_ms=round(1000.0 * enq_dt, 1),
+                        total_ms=round(1000.0 * total_dt, 1),
+                        budget_ratio=round(float(budget_ratio), 3) if budget_ratio is not None else None,
+                        eeg_get_ms=(
+                            round(float(eeg_buffer.get_latest_get_ms()), 1)
+                            if eeg_buffer.get_latest_get_ms() is not None
+                            else None
+                        ),
                         eeg_signal=eeg_vec,
                         stream_started=stream_started,
                         queue_size=audio._spk_queue.qsize(),
                         playback_stats=asdict(audio.get_stats()),
                     )
+                    if budget_ratio is not None and budget_ratio >= CHUNK_OVERRUN_WARN_RATIO:
+                        LOGGER.warning(
+                            "chunk processing close to/over realtime budget: "
+                            "chunk=%s total_ms=%.1f audio_ms=%.1f ratio=%.3f",
+                            chunk_idx,
+                            1000.0 * total_dt,
+                            chunk_audio_ms,
+                            budget_ratio,
+                        )
 
         t_enq = time.perf_counter()
         packer.flush(
