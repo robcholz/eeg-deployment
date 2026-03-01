@@ -25,6 +25,8 @@ STREAM_PREBUFFER_SECONDS = 0.2
 EEG_GAIN_SMOOTHING_ALPHA = 0.35
 CHUNK_OVERRUN_WARN_RATIO = 0.9
 EEG_GET_WARN_MS = 800.0
+LIVE_SAMPLE_RATE = 16_000
+LIVE_PROGRESS_EVERY_CHUNKS = 2
 
 _EVENT_LEVELS = {
     "program_start": logging.INFO,
@@ -781,12 +783,252 @@ def _stream_process_and_play(input_path: Path, state: ProgramState, eeg_real_tim
     state.timings_s["enqueue_speaker"] = round(enqueue_s, 4)
 
 
+def _stream_process_and_play_live(state: ProgramState, eeg_real_time: bool) -> None:
+    state.sample_rate = LIVE_SAMPLE_RATE
+    state.input_samples = None
+    state.chunks_total = None
+
+    chunk_samples = max(1, int(state.sample_rate * STREAM_CHUNK_SECONDS))
+    chunk_bytes = chunk_samples * 2 * state.playback_channels
+    _log_event(
+        "live_capture_started",
+        state,
+        sample_rate=state.sample_rate,
+        chunk_samples=chunk_samples,
+        chunk_seconds=STREAM_CHUNK_SECONDS,
+    )
+
+    eeg_buffer = _EegSignalBuffer(real_time=eeg_real_time)
+    eeg_buffer.start()
+
+    t0 = time.perf_counter()
+    separator = SnnSeparator()
+    state.timings_s["model_load"] = round(time.perf_counter() - t0, 4)
+    _log_event(
+        "snn_model_loaded",
+        state,
+        model_device=str(separator.device),
+        checkpoint=str(SNN_MODEL_PATH),
+    )
+
+    audio = AlsaPcmDuplex(
+        device=state.playback_device,
+        rate=state.sample_rate,
+        channels=state.playback_channels,
+        frames_per_block=256,
+    )
+    packer = _SpeakerBlockPacker(audio=audio)
+
+    separation_s = 0.0
+    gain_mix_s = 0.0
+    enqueue_s = 0.0
+    stream_started = False
+    prebuffer_blocks = max(
+        4,
+        min(
+            32,
+            int((STREAM_PREBUFFER_SECONDS * state.sample_rate) / audio.frames_per_block),
+        ),
+    )
+    state.prebuffer_blocks = prebuffer_blocks
+
+    state.phase = "stream_playback"
+    _log_event(
+        "eeg_worker_started",
+        state,
+        eeg_mode="real-time" if eeg_real_time else "offline",
+        eeg_enabled=eeg_buffer.enabled,
+    )
+
+    def _maybe_start_output_stream() -> None:
+        nonlocal stream_started
+        if stream_started:
+            return
+        if packer.enqueued_blocks < prebuffer_blocks:
+            return
+        audio.start_output_stream()
+        stream_started = True
+        _log_event(
+            "output_stream_started",
+            state,
+            prebuffer_seconds=round(
+                (prebuffer_blocks * audio.frames_per_block) / state.sample_rate, 4
+            ),
+        )
+
+    mic_buffer = bytearray()
+    chunk_idx = 0
+    audio.start_input_stream()
+    _log_event("input_stream_started", state, frames_per_block=audio.frames_per_block)
+
+    try:
+        while True:
+            frame = audio.read_mic_frame(timeout_s=1.0)
+            if frame is None:
+                continue
+            mic_buffer.extend(frame)
+
+            while len(mic_buffer) >= chunk_bytes:
+                t_chunk0 = time.perf_counter()
+                raw = bytes(mic_buffer[:chunk_bytes])
+                del mic_buffer[:chunk_bytes]
+                chunk_idx += 1
+
+                chunk = _pcm_bytes_to_mono_float(
+                    raw_bytes=raw,
+                    sample_width=2,
+                    channels=state.playback_channels,
+                )
+                if chunk.size == 0:
+                    continue
+
+                t_sep = time.perf_counter()
+                separated_sources = separator.separate_chunk(chunk)
+                sep_dt = time.perf_counter() - t_sep
+                separation_s += sep_dt
+
+                if state.num_sources is None:
+                    state.num_sources = len(separated_sources)
+                    state.gains = [1.0 / state.num_sources] * state.num_sources
+                    _log_event("gains_initialized", state)
+
+                eeg_vec = eeg_buffer.get_latest()
+                if eeg_vec is not None and state.num_sources is not None:
+                    target_gains = _map_eeg_vector_to_gains(
+                        eeg_vec=eeg_vec,
+                        num_sources=state.num_sources,
+                    )
+                    state.gains = _smooth_gains(
+                        prev=state.gains,
+                        target=target_gains,
+                        alpha=EEG_GAIN_SMOOTHING_ALPHA,
+                    )
+
+                t_mix = time.perf_counter()
+                mixed_output = apply_source_gains(separated_sources, state.gains)
+                mix_dt = time.perf_counter() - t_mix
+                gain_mix_s += mix_dt
+
+                t_enq = time.perf_counter()
+                packer.push(
+                    mono_audio=mixed_output,
+                    timeout_s=STREAM_QUEUE_TIMEOUT_S,
+                    on_block_enqueued=_maybe_start_output_stream,
+                )
+                enq_dt = time.perf_counter() - t_enq
+                enqueue_s += enq_dt
+
+                state.enqueued_frames = int(packer.source_frames)
+                state.enqueued_blocks = int(packer.enqueued_blocks)
+                state.dropped_blocks = int(packer.dropped_blocks)
+                state.inserted_silence_frames = int(packer.inserted_silence_frames)
+                state.chunks_processed = chunk_idx
+                state.mixed_samples = int(packer.source_frames)
+
+                if (
+                    chunk_idx == 1
+                    or chunk_idx % LIVE_PROGRESS_EVERY_CHUNKS == 0
+                ):
+                    total_dt = time.perf_counter() - t_chunk0
+                    chunk_audio_ms = 1000.0 * (float(chunk.size) / float(state.sample_rate))
+                    budget_ratio = (1000.0 * total_dt / chunk_audio_ms) if chunk_audio_ms > 0 else None
+                    _log_event(
+                        "stream_progress",
+                        state,
+                        chunk_audio=_audio_array_stats(mixed_output),
+                        chunk_audio_ms=round(chunk_audio_ms, 1),
+                        sep_ms=round(1000.0 * sep_dt, 1),
+                        mix_ms=round(1000.0 * mix_dt, 1),
+                        enqueue_ms=round(1000.0 * enq_dt, 1),
+                        total_ms=round(1000.0 * total_dt, 1),
+                        budget_ratio=round(float(budget_ratio), 3) if budget_ratio is not None else None,
+                        eeg_get_ms=(
+                            round(float(eeg_buffer.get_latest_get_ms()), 1)
+                            if eeg_buffer.get_latest_get_ms() is not None
+                            else None
+                        ),
+                        eeg_signal=eeg_vec,
+                        stream_started=stream_started,
+                        queue_size=audio._spk_queue.qsize(),
+                        playback_stats=asdict(audio.get_stats()),
+                    )
+                    if budget_ratio is not None and budget_ratio >= CHUNK_OVERRUN_WARN_RATIO:
+                        LOGGER.warning(
+                            "chunk processing close to/over realtime budget: "
+                            "chunk=%s total_ms=%.1f audio_ms=%.1f ratio=%.3f",
+                            chunk_idx,
+                            1000.0 * total_dt,
+                            chunk_audio_ms,
+                            budget_ratio,
+                        )
+    except KeyboardInterrupt:
+        LOGGER.info("live capture interrupted by user")
+    finally:
+        try:
+            audio.stop_input_stream()
+        except Exception:
+            pass
+
+        t_enq = time.perf_counter()
+        packer.flush(
+            timeout_s=STREAM_QUEUE_TIMEOUT_S,
+            on_block_enqueued=_maybe_start_output_stream,
+        )
+        enqueue_s += time.perf_counter() - t_enq
+        state.enqueued_frames = int(packer.source_frames)
+        state.enqueued_blocks = int(packer.enqueued_blocks)
+        state.dropped_blocks = int(packer.dropped_blocks)
+        state.inserted_silence_frames = int(packer.inserted_silence_frames)
+        state.mixed_samples = int(packer.source_frames)
+
+        if not stream_started and state.enqueued_blocks > 0:
+            audio.start_output_stream()
+            stream_started = True
+            _log_event("output_stream_started", state, reason="late_start_live")
+
+        state.phase = "stream_drain"
+        _log_event(
+            "drain_start",
+            state,
+            enqueued_frames=state.enqueued_frames,
+            enqueued_blocks=state.enqueued_blocks,
+            dropped_blocks=state.dropped_blocks,
+        )
+        if state.enqueued_blocks > 0:
+            enqueued_playback_frames = state.enqueued_blocks * audio.frames_per_block
+            drain_timeout_s = max(2.0, (enqueued_playback_frames / state.sample_rate) + 2.0)
+            drained = _wait_for_playback_drain(audio, timeout_s=drain_timeout_s)
+        else:
+            drained = True
+        stats = audio.get_stats()
+        state.played_frames = int(stats.frames_out)
+        state.queue_drops = int(stats.queue_drops)
+        state.drained = bool(drained)
+        state.output_underflows = int(stats.output_underflows)
+        state.consumer_consumed_all = bool(
+            drained and state.dropped_blocks == 0 and state.queue_drops == 0
+        )
+        _log_event("drain_done", state, drained=drained, playback_stats=asdict(stats))
+
+        eeg_buffer.stop()
+        if stream_started:
+            audio.stop_output_stream()
+            _log_event("output_stream_stopped", state)
+
+    state.timings_s["snn_separation"] = round(separation_s, 4)
+    state.timings_s["apply_gains"] = round(gain_mix_s, 4)
+    state.timings_s["enqueue_speaker"] = round(enqueue_s, 4)
+
+
 def main() -> None:
     _configure_logging()
     parser = argparse.ArgumentParser(
-        description="Stream input through SNN_Sound separation and play while processing."
+        description=(
+            "SNN_Sound separation and playback. "
+            "If --wav is omitted, runs real-time microphone mode."
+        )
     )
-    parser.add_argument("--wav", required=True, help="Path to input WAV file.")
+    parser.add_argument("--wav", required=False, help="Path to input WAV file.")
     parser.add_argument(
         "--eeg-real-time",
         action="store_true",
@@ -795,8 +1037,8 @@ def main() -> None:
     args = parser.parse_args()
 
     total_t0 = time.perf_counter()
-    input_path = Path(args.wav).expanduser()
-    state = ProgramState(wav=str(input_path))
+    input_path = Path(args.wav).expanduser() if args.wav else None
+    state = ProgramState(wav=str(input_path) if input_path is not None else "<live_mic>")
     _log_event(
         "program_start",
         state,
@@ -805,19 +1047,27 @@ def main() -> None:
         checkpoint=str(SNN_MODEL_PATH),
         stream_chunk_seconds=STREAM_CHUNK_SECONDS,
         stream_prebuffer_seconds=STREAM_PREBUFFER_SECONDS,
+        source_mode="wav" if args.wav else "live_mic",
     )
 
     try:
         state.phase = "validate_input"
         _log_event("input_validation_start", state)
-        if not input_path.exists():
-            raise FileNotFoundError(f"WAV file not found: {input_path}")
-
-        _stream_process_and_play(
-            input_path=input_path,
-            state=state,
-            eeg_real_time=bool(args.eeg_real_time),
-        )
+        if args.wav:
+            assert input_path is not None
+            if not input_path.exists():
+                raise FileNotFoundError(f"WAV file not found: {input_path}")
+            _stream_process_and_play(
+                input_path=input_path,
+                state=state,
+                eeg_real_time=bool(args.eeg_real_time),
+            )
+        else:
+            state.wav = "<live_mic>"
+            _stream_process_and_play_live(
+                state=state,
+                eeg_real_time=bool(args.eeg_real_time),
+            )
 
         state.phase = "completed"
         state.timings_s["total"] = round(time.perf_counter() - total_t0, 4)

@@ -10,3 +10,5 @@ scripts/__pycache__/
 
 earcode/model_3D/
 EAR_4_direction_1D.mat
+
+run.log
