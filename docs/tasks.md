@@ -9,4 +9,8 @@
 - [ ] attach sound source separation to real mic
 - [ ] attach eeg part to real mic.
 
+## Second Stage: If possible
+
+- [ ] --eeg-real-time cause the overbudget per frame
+
 
